@@ -1,12 +1,12 @@
 import streamlit as st
 from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support.ui import Select
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
 import time
 import re
 import pandas as pd
@@ -16,539 +16,614 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
 from datetime import datetime
+import json
+import os
+import contextlib
+
+# Google 서비스 계정 키 로드
+SERVICE_ACCOUNT_FILE = "service_account_key.json"
+
+# Google Sheets ID
+GOOGLE_SHEETS_ID = "1ghPP5RLJdQyGBJ-hUVp-P-Iq6qbhaFPVcGIl0DRpweA"
+GOOGLE_SHEETS_RANGE = "시트1!A1:Z1000"  # 시트1의 A1부터 Z1000까지
+
+def load_service_account():
+    """서비스 계정 키 파일 로드"""
+    if os.path.exists(SERVICE_ACCOUNT_FILE):
+        try:
+            with open(SERVICE_ACCOUNT_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            return None
+    return None
+
+
+def load_google_sheets_data(credentials):
+    """Google Sheets에서 데이터를 읽어서 pandas DataFrame으로 반환"""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound, APIError
+        
+        # 인증 범위 설정
+        scopes = [
+            'https://www.googleapis.com/auth/spreadsheets.readonly',
+            'https://www.googleapis.com/auth/drive.readonly'
+        ]
+        
+        # 서비스 계정 인증 정보 생성
+        creds = Credentials.from_service_account_info(credentials, scopes=scopes)
+        client = gspread.authorize(creds)
+        
+        # 시트 열기
+        sheet = client.open_by_key(GOOGLE_SHEETS_ID)
+        
+        # 사용 가능한 워크시트 목록 확인
+        available_worksheets = [ws.title for ws in sheet.worksheets()]
+        
+        # 시트 이름 찾기 (여러 가능한 이름 시도)
+        worksheet = None
+        possible_sheet_names = ["시트1", "Sheet1", "요금자료", available_worksheets[0] if available_worksheets else None]
+        
+        for sheet_name in possible_sheet_names:
+            if sheet_name is None:
+                continue
+            try:
+                worksheet = sheet.worksheet(sheet_name)
+                break
+            except WorksheetNotFound:
+                continue
+        
+        if worksheet is None:
+            error_msg = f"시트를 찾을 수 없습니다. 사용 가능한 시트: {', '.join(available_worksheets)}"
+            return None, error_msg
+        
+        # 모든 데이터 가져오기
+        all_values = worksheet.get_all_values()
+        
+        if not all_values or len(all_values) < 2:
+            return None, "시트에 데이터가 없습니다."
+        
+        # 첫 번째 행은 비어있고, 두 번째 행이 헤더
+        # 헤더는 2번째 행 (인덱스 1), 데이터는 3번째 행부터
+        headers = all_values[1]  # 2번째 행이 헤더
+        data_rows = all_values[2:]  # 3번째 행부터가 데이터
+        
+        # 빈 행 제거
+        data_rows = [row for row in data_rows if any(cell.strip() for cell in row)]
+        
+        if not data_rows:
+            return None, "데이터 행이 없습니다."
+        
+        # pandas DataFrame 생성
+        df = pd.DataFrame(data_rows, columns=headers)
+        
+        # 빈 열 제거
+        df = df.dropna(axis=1, how='all')
+        
+        return df, None
+        
+    except ImportError as e:
+        return None, f"gspread 라이브러리가 설치되지 않았습니다: {str(e)}\n\npip install gspread google-auth를 실행해주세요."
+    except SpreadsheetNotFound:
+        return None, f"스프레드시트를 찾을 수 없습니다. 시트 ID를 확인해주세요: {GOOGLE_SHEETS_ID}"
+    except APIError as e:
+        error_msg = str(e)
+        if "PERMISSION_DENIED" in error_msg or "insufficient authentication" in error_msg.lower():
+            return None, f"권한 오류: 서비스 계정에 시트 접근 권한이 없습니다.\n\n서비스 계정 이메일({credentials.get('client_email', '')})에 시트 공유 권한을 부여해주세요."
+        return None, f"Google API 오류: {error_msg}"
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        return None, f"Google Sheets 읽기 오류:\n{str(e)}\n\n상세 오류:\n{error_detail[-500:]}"  # 마지막 500자만 표시
 
 def search_address(address, dong=None, ho=None):
-    """주소 검색을 자동화하는 함수"""
+    """주소 검색 자동화 - Selenium 구현 위임"""
+    return search_address_selenium(address, dong, ho)
+
+def _unused_playwright_impl():
+    # Legacy Playwright implementation disabled
+    pass
+
+def search_address_selenium(address, dong=None, ho=None):
+    """주소 검색 자동화 (Selenium)"""
     try:
-        # Chrome 드라이버 설정
-        options = webdriver.ChromeOptions()
-        # options.add_argument('--headless')  # 디버깅을 위해 주석 처리
-        options.add_argument('--disable-gpu')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-        
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-        
-        # SK브로드밴드 주소 검색 페이지 접속
+        chrome_options = webdriver.ChromeOptions()
+        # 기본은 브라우저 표시(HEADFUL). 환경변수로 전환 가능
+        headful = os.getenv("SELENIUM_HEADFUL", "1") == "1"
+        if not headful:
+            chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--window-size=1280,900")
+        chrome_options.add_argument("--lang=ko-KR")
+        chrome_options.add_argument("--disable-features=IsolateOrigins,site-per-process")
+
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+        wait = WebDriverWait(driver, 15)
+
         url = "https://www.bworld.co.kr/myb/product/join/address/svcAveSearch.do"
         driver.get(url)
         
-        # 페이지 로딩 대기
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        
-        time.sleep(2)  # 추가 대기 시간
-        
-        # 주소 입력창 찾기 및 입력
+        # 문서 로드 대기(최대 10초)
         try:
-            # 주소 입력창 찾기 (여러 가능한 셀렉터 시도)
-            input_selectors = [
-                "input[name='keyword']",
-                "input[type='text'][placeholder*='주소']",
-                "input[type='text']",
-                "input[placeholder*='지번, 도로명, 건물명']",
-                "#keyword",
-                ".keyword",
-                "input.input-search",
-                "#addrInput",
-                "input#keyword",
-                "input.keyword"
-            ]
-            
-            input_element = None
-            found_selector = None
-            for selector in input_selectors:
+            WebDriverWait(driver, 10).until(lambda d: d.execute_script("return document.readyState") == "complete")
+        except Exception:
+            pass
+        
+        # 잠재적 팝업/배너 닫기 시도 (무시 가능)
+        try:
+            for sel in [
+                'a.modal_close.modal_confirm_btn',
+                'button.close',
+                '.btn-close',
+            ]:
+                with contextlib.suppress(Exception):
+                    el = driver.find_element(By.CSS_SELECTOR, sel)
+                    if el.is_displayed():
+                        el.click()
+                        time.sleep(0.5)
+        except Exception:
+            pass
+        
+        # 입력창 찾기: 메인 → 모든 iframe 재귀 순회
+        input_selectors = [
+            "#inpNameStreet",              # 페이지 공식 주소 입력 필드
+            "input[name='keyword']",
+            "input#keyword",
+            "#keyword",
+            "input[placeholder*='주소']",
+            "input[placeholder*='지번']",
+            "input[placeholder*='도로명']",
+            "input[type='search']",
+            "input[type='text']",
+        ]
+        input_el = None
+
+        def find_visible_input(scope_driver):
+            for sel in input_selectors:
                 try:
-                    input_element = WebDriverWait(driver, 2).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                    )
-                    if input_element:
-                        found_selector = selector
+                    el = scope_driver.find_element(By.CSS_SELECTOR, sel)
+                    if el and el.is_displayed():
+                        return el
+                except Exception:
+                    continue
+            return None
+
+        def find_input_recursively(scope_driver, depth=0, max_depth=3):
+            el = find_visible_input(scope_driver)
+            if el:
+                return el
+            if depth >= max_depth:
+                return None
+            frames = scope_driver.find_elements(By.TAG_NAME, 'iframe')
+            for frame in frames:
+                try:
+                    scope_driver.switch_to.frame(frame)
+                    found = find_input_recursively(scope_driver, depth + 1, max_depth)
+                    if found:
+                        return found
+                except Exception:
+                    pass
+                finally:
+                    scope_driver.switch_to.default_content()
+            return None
+
+        # 1) 기본 문서/프레임 전체에서 검색
+        input_el = find_input_recursively(driver)
+
+        # 2) 못 찾으면 visibility 대기 후 재시도
+        if input_el is None:
+            # 가시성 기준이 안 맞았을 수 있어 존재 기준 + 가시성 대기
+            try:
+                for sel in input_selectors:
+                    try:
+                        input_el = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, sel)))
+                        if input_el:
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        
+        if input_el is None:
+            screenshot_path = "error_page.png"
+            driver.save_screenshot(screenshot_path)
+            driver.quit()
+            return {"status": "error", "message": "주소 입력창을 찾을 수 없습니다.", "screenshot": screenshot_path}
+        
+        # 입력 요소 인터랙션 강화: 스크롤/클릭/JS 대체
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", input_el)
+        except Exception:
+            pass
+        
+        try:
+            wait.until(EC.element_to_be_clickable((By.XPATH, "(//input[@name='keyword']|//*[@id='keyword']|//input[@type='text'])[1]")))
+        except Exception:
+            pass
+        
+        interacted = False
+        try:
+            input_el.clear()
+        except Exception:
+            pass
+        try:
+            ActionChains(driver).move_to_element(input_el).pause(0.1).click().perform()
+            input_el.send_keys(address)
+            interacted = True
+        except Exception:
+            pass
+        
+        if not interacted:
+            # JS로 값 설정 및 input 이벤트 발생
+            try:
+                driver.execute_script(
+                    "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles:true}));",
+                    input_el,
+                    address,
+                )
+                interacted = True
+            except Exception:
+                pass
+        
+        # 제출: 전용 조회 버튼(#btnNameSearchStreet) → 기타 버튼 → 엔터 → 폼 submit 순차 시도
+        submitted = False
+        submit_selectors = [
+            "#btnNameSearchStreet",
+            "button.btn-search",
+            "button[type='submit']",
+            ".btn-search",
+            "input[type='submit']",
+            "#searchBtn",
+            "a.btn-search"
+        ]
+        if interacted:
+            for sel in submit_selectors:
+                try:
+                    btn = driver.find_element(By.CSS_SELECTOR, sel)
+                    if btn.is_displayed():
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                        btn.click()
+                        submitted = True
                         break
-                except:
+                except Exception:
                     continue
             
-            # 입력창을 찾지 못한 경우 모든 input 요소 나열
-            if not input_element:
+            if not submitted:
                 try:
-                    all_inputs = driver.find_elements(By.TAG_NAME, "input")
-                    error_msg = f"주소 입력창을 찾을 수 없습니다. 페이지에 {len(all_inputs)}개의 input 요소가 있습니다."
-                    if len(all_inputs) > 0:
-                        error_msg += "\n찾은 input 요소들:"
-                        for inp in all_inputs[:5]:  # 처음 5개만
-                            try:
-                                error_msg += f"\n- type={inp.get_attribute('type')}, id={inp.get_attribute('id')}, name={inp.get_attribute('name')}, placeholder={inp.get_attribute('placeholder')}"
-                            except:
-                                pass
-                    
-                    screenshot_path = "error_page.png"
-                    driver.save_screenshot(screenshot_path)
-                    
-                    return {
-                        "status": "error",
-                        "message": error_msg,
-                        "screenshot": screenshot_path
-                    }
-                except:
+                    ActionChains(driver).move_to_element(input_el).send_keys(Keys.ENTER).perform()
+                    submitted = True
+                except Exception:
                     pass
             
-            if input_element:
-                # 주소 입력
-                input_element.clear()
-                input_element.send_keys(address)
-                time.sleep(0.5)
-                
-                # Enter 키 전송 또는 조회 버튼 클릭
+            if not submitted:
                 try:
-                    # 조회 버튼 찾기
-                    submit_selectors = [
-                        "button.btn-search",
-                        "button[type='submit']",
-                        ".btn-search",
-                        "input[type='submit']",
-                        "#searchBtn",
-                        "a.btn-search"
-                    ]
-                    
-                    for selector in submit_selectors:
-                        try:
-                            submit_button = driver.find_element(By.CSS_SELECTOR, selector)
-                            submit_button.click()
-                            break
-                        except:
-                            continue
-                    else:
-                        # 버튼을 찾지 못한 경우 Enter 키 사용
-                        input_element.send_keys(Keys.RETURN)
-                except Exception as e:
-                    input_element.send_keys(Keys.RETURN)
-                
-                # 결과 대기
+                    form = input_el.find_element(By.XPATH, "ancestor::form")
+                    driver.execute_script("arguments[0].submit();", form)
+                    submitted = True
+                except Exception:
+                    pass
+        
+        time.sleep(2)
+
+        results = []
+        first_clickable = None
+        result_selectors = [
+            ".result-list li",
+            ".search-result li",
+            ".addr-list li",
+            "ul.list-result li",
+            ".result-item",
+            "li[class*='item']"
+        ]
+        # 우선 라디오 결과(주소 선택) 우선 탐색
+        try:
+            radios = driver.find_elements(By.CSS_SELECTOR, ".adress_search_result-item input[type='radio']")
+            if radios:
+                # 첫 번째 라디오의 label 클릭
+                first_radio = radios[0]
+                radio_id = first_radio.get_attribute("id") or "radio_01"
+                try:
+                    lbl = driver.find_element(By.CSS_SELECTOR, f"label[for='{radio_id}']")
+                    with contextlib.suppress(Exception):
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", lbl)
+                    try:
+                        lbl.click()
+                    except Exception:
+                        with contextlib.suppress(Exception):
+                            driver.execute_script("arguments[0].click();", lbl)
+                    time.sleep(1.0)
+                    first_clickable = lbl
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        for sel in result_selectors:
+            try:
+                elems = driver.find_elements(By.CSS_SELECTOR, sel)
+                if elems:
+                    for e in elems:
+                        txt = e.text.strip()
+                        if txt:
+                            results.append(txt)
+                            if not first_clickable:
+                                first_clickable = e
+                    if results:
+                        break
+            except Exception:
+                continue
+
+        selected_result = None
+        if first_clickable:
+            try:
+                with contextlib.suppress(Exception):
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", first_clickable)
+                try:
+                    first_clickable.click()
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        driver.execute_script("arguments[0].click();", first_clickable)
                 time.sleep(2)
-                
-                # 검색 결과 추출
-                results = []
+                info_selectors = [
+                    ".result-detail",
+                    ".selected-address",
+                    "div[class*='detail']",
+                    "div[class*='result']",
+                    "table",
+                    ".info-table",
+                    ".address-info"
+                ]
+                details = []
+                for sel in info_selectors:
+                    try:
+                        for de in driver.find_elements(By.CSS_SELECTOR, sel):
+                            t = de.text.strip()
+                            if t and len(t) > 10:
+                                details.append(t)
+                        if details:
+                            break
+                    except Exception:
+                        continue
+                if details:
+                    selected_result = "\n".join(details)
+                else:
+                    try:
+                        body_text = driver.find_element(By.TAG_NAME, "body").text
+                        selected_result = body_text[:500]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # 서비스조회 라디오/버튼 처리 및 동/호 선택 (유사 매칭)
+        def fuzzy_match(target_text, option_text):
+            try:
+                if not target_text or not option_text:
+                    return False
+                t = target_text.strip()
+                o = option_text.strip()
+                if t == o or t in o or o in t:
+                    return True
+                import re as _re
+                t_digits = ''.join(_re.findall(r'\d+', t))
+                o_digits = ''.join(_re.findall(r'\d+', o))
+                if t_digits and t_digits == o_digits:
+                    return True
+                t_nums = set(_re.findall(r'\d+', t))
+                o_nums = set(_re.findall(r'\d+', o))
+                return bool(t_nums and o_nums and (t_nums & o_nums))
+            except Exception:
+                return False
+
+        def similarity_score(target_text, option_element):
+            try:
+                import re as _re
+                otext = (option_element.text or "").strip()
+                oval = option_element.get_attribute('data-value') or ""
+                t = (target_text or "").strip()
+                # exact on data-value
+                if oval and oval == t:
+                    return 0
+                # digits-based distance
+                tnums = _re.findall(r'\d+', t)
+                onums_text = _re.findall(r'\d+', otext)
+                onums_val = _re.findall(r'\d+', oval)
+                if tnums:
+                    tnum = int(tnums[0])
+                    cands = []
+                    if onums_text:
+                        cands.append(int(onums_text[0]))
+                    if onums_val:
+                        cands.append(int(onums_val[0]))
+                    if cands:
+                        return min(abs(tnum - c) for c in cands)
+                # fallback: inclusion/length diff
+                if t and (t in otext or otext in t or t in oval or oval in t):
+                    return 1
+                return max(len(t), 1)
+            except Exception:
+                return 9999
+
+        # 라디오 선택
+        try:
+            for sel in ["label[for='radio_01']", "#radio_01", "input[type='radio'][id='radio_01']"]:
                 try:
-                    # 검색 결과 리스트 찾기 (여러 가능한 셀렉터 시도)
-                    result_selectors = [
-                        ".result-list li",
-                        ".search-result li",
-                        ".addr-list li",
-                        "ul.list-result li",
-                        ".result-item",
-                        "div[class*='result']",
-                        "li[class*='item']"
-                    ]
-                    
-                    first_result_element = None
-                    for selector in result_selectors:
+                    el = driver.find_element(By.CSS_SELECTOR, sel)
+                    if el.is_displayed():
                         try:
-                            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                            if elements:
-                                for elem in elements:
-                                    text = elem.text.strip()
-                                    if text and len(text) > 0:
-                                        results.append(text)
-                                        if not first_result_element:
-                                            first_result_element = elem
-                                if results:
-                                    break
-                        except:
-                            continue
-                    
-                    # 첫 번째 결과 항목 클릭
-                    selected_result = None
-                    if first_result_element and len(results) > 0:
+                            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                        except Exception:
+                            pass
                         try:
-                            # 첫 번째 항목 클릭
-                            first_result_element.click()
-                            time.sleep(2)  # 결과 페이지 로딩 대기
-                            
-                            # 선택된 결과 페이지의 내용 추출
-                            try:
-                                # 결과 페이지에서 주요 정보 추출
-                                result_info = []
-                                
-                                # 여러 가능한 정보 셀렉터 시도
-                                info_selectors = [
-                                    ".result-detail",
-                                    ".selected-address",
-                                    "div[class*='detail']",
-                                    "div[class*='result']",
-                                    "table",
-                                    ".info-table",
-                                    ".address-info"
-                                ]
-                                
-                                for info_selector in info_selectors:
-                                    try:
-                                        info_elements = driver.find_elements(By.CSS_SELECTOR, info_selector)
-                                        for info_elem in info_elements:
-                                            text = info_elem.text.strip()
-                                            if text and len(text) > 10:  # 의미있는 텍스트만
-                                                result_info.append(text)
-                                        if result_info:
-                                            break
-                                    except:
-                                        continue
-                                
-                                if result_info:
-                                    selected_result = "\n".join(result_info)
-                                else:
-                                    # 전체 body 텍스트 가져오기
-                                    body_text = driver.find_element(By.TAG_NAME, "body").text
-                                    selected_result = body_text[:500]  # 처음 500자만
-                            except Exception as e:
-                                selected_result = f"결과 페이지 로딩 완료 (정보 추출 중 오류: {str(e)})"
-                        except Exception as e:
-                            selected_result = f"첫 번째 항목 클릭 중 오류: {str(e)}"
-                    
-                    # 서비스조회 버튼 클릭
-                    service_result = None
-                    if first_result_element and len(results) > 0:
-                        try:
-                            # 라디오 버튼 선택 (label[for="radio_01"])
-                            radio_selectors = [
-                                'label[for="radio_01"]',
-                                'label[for=radio_01]',
-                                '#radio_01',
-                                'input[type="radio"][id="radio_01"]'
-                            ]
-                            
-                            radio_element = None
-                            for selector in radio_selectors:
-                                try:
-                                    radio_element = driver.find_element(By.CSS_SELECTOR, selector)
-                                    if radio_element:
-                                        radio_element.click()
-                                        time.sleep(0.5)
-                                        break
-                                except:
-                                    continue
-                            
-                            # 서비스조회 버튼 찾기 (div.butn_wrap.event_pop_butn)
-                            service_btn_selectors = [
-                                'div.butn_wrap.event_pop_butn',
-                                'div.butn_wrap.event_pop_butn button',
-                                'div.butn_wrap.event_pop_butn a',
-                                '.butn_wrap.event_pop_butn',
-                                "button:contains('서비스조회')",
-                                "a:contains('서비스조회')",
-                                "button.btn-service-search",
-                                ".btn-search-service"
-                            ]
-                            
-                            service_button = None
-                            for selector in service_btn_selectors:
-                                try:
-                                    if ':contains(' in selector:
-                                        # contains 셀렉터는 직접 구현
-                                        buttons = driver.find_elements(By.TAG_NAME, "button")
-                                        links = driver.find_elements(By.TAG_NAME, "a")
-                                        for btn in buttons + links:
-                                            if "서비스조회" in btn.text:
-                                                service_button = btn
-                                                break
-                                    else:
-                                        service_button = driver.find_element(By.CSS_SELECTOR, selector)
-                                    if service_button:
-                                        break
-                                except:
-                                    continue
-                            
-                            if service_button:
-                                service_button.click()
-                                time.sleep(2)  # 서비스조회 결과 대기
-                                
-                                # 팝업 확인 버튼 클릭 (존재하는 경우)
-                                try:
-                                    popup_confirm = driver.find_element(By.CSS_SELECTOR, 'div.butn_wrap a.modal_close.modal_confirm_btn')
-                                    if popup_confirm:
-                                        popup_confirm.click()
-                                        time.sleep(1)
-                                        
-                                        # 동 선택 버튼 클릭 (button#input_Id3)
-                                        try:
-                                            # 동 선택 버튼 찾기 및 클릭
-                                            dong_button = WebDriverWait(driver, 5).until(
-                                                EC.element_to_be_clickable((By.CSS_SELECTOR, 'button#input_Id3'))
-                                            )
-                                            dong_button.click()
-                                            time.sleep(0.8)  # 드롭다운 열리기 대기
-                                            
-                                            # 동 입력값이 있으면 해당 값을 가진 버튼 선택, 없으면 첫 번째 선택
-                                            if dong:
-                                                # 드롭다운 리스트가 보일 때까지 대기
-                                                WebDriverWait(driver, 10).until(
-                                                    EC.presence_of_element_located((By.CSS_SELECTOR, 'ul#dongSelectList'))
-                                                )
-                                                time.sleep(0.5)  # 추가 대기
-                                                
-                                                # 모든 동 옵션 가져오기
-                                                dong_options = driver.find_elements(By.CSS_SELECTOR, 'ul#dongSelectList li button')
-                                                
-                                                matched = False
-                                                for option in dong_options:
-                                                    try:
-                                                        option_text = option.text.strip()
-                                                        option_onclick = option.get_attribute('onclick')
-                                                        
-                                                        # 근사값 매칭 (유사한 정보도 매칭)
-                                                        # 1. 텍스트가 정확히 일치
-                                                        # 2. 포함 검사 (양방향)
-                                                        # 3. 숫자 매칭
-                                                        dong_digits = ''.join(re.findall(r'\d+', dong))
-                                                        option_digits = ''.join(re.findall(r'\d+', option_text))
-                                                        dong_numbers = re.findall(r'\d+', dong)
-                                                        option_numbers = re.findall(r'\d+', option_text)
-                                                        
-                                                        if (option_text == dong or 
-                                                            dong in option_text or 
-                                                            option_text in dong or 
-                                                            dong_digits == option_digits or
-                                                            (dong_numbers and option_numbers and any(num in option_numbers for num in dong_numbers))):
-                                                            # JavaScript로 클릭 (더 안정적)
-                                                            driver.execute_script("arguments[0].click();", option)
-                                                            matched = True
-                                                            time.sleep(2)  # 호 데이터 로딩 대기
-                                                            break
-                                                    except:
-                                                        continue
-                                                
-                                                if not matched:
-                                                    # 매칭 실패 시 첫 번째 항목 선택
-                                                    try:
-                                                        first_dong_option = driver.find_element(By.CSS_SELECTOR, 'ul#dongSelectList li:first-child button')
-                                                        driver.execute_script("arguments[0].click();", first_dong_option)
-                                                        time.sleep(2)
-                                                    except:
-                                                        pass
-                                            else:
-                                                # 첫 번째 항목 선택
-                                                try:
-                                                    first_dong_option = driver.find_element(By.CSS_SELECTOR, 'ul#dongSelectList li:first-child button')
-                                                    driver.execute_script("arguments[0].click();", first_dong_option)
-                                                    time.sleep(2)
-                                                except:
-                                                    pass
-                                        except Exception as e:
-                                            pass  # 동 선택 실패 시 계속 진행
-                                        
-                                        # 호 선택 버튼 클릭 (button#input_Id4)
-                                        try:
-                                            ho_button = driver.find_element(By.CSS_SELECTOR, 'button#input_Id4')
-                                            if ho_button:
-                                                ho_button.click()
-                                                time.sleep(0.8)  # 드롭다운 열리기 대기
-                                                
-                                                # 호수 입력값이 있으면 해당 값을 가진 버튼 선택, 없으면 첫 번째 선택
-                                                if ho:
-                                                    # 커스텀 셀렉트박스 처리
-                                                    WebDriverWait(driver, 10).until(
-                                                        EC.presence_of_element_located((By.CSS_SELECTOR, 'ul#hoSelectList'))
-                                                    )
-                                                    time.sleep(0.5)  # 추가 대기
-                                                    
-                                                    ho_options = driver.find_elements(By.CSS_SELECTOR, 'ul#hoSelectList li button')
-                                                    
-                                                    matched = False
-                                                    for option in ho_options:
-                                                        try:
-                                                            option_text = option.text.strip()
-                                                            option_data_value = option.get_attribute('data-value')
-                                                            
-                                                            # 근사값 매칭 (유사한 정보도 매칭)
-                                                            # 1. 텍스트가 정확히 일치
-                                                            # 2. 포함 검사 (양방향)
-                                                            # 3. 숫자 매칭
-                                                            ho_digits = ''.join(re.findall(r'\d+', ho))
-                                                            option_digits = ''.join(re.findall(r'\d+', option_text))
-                                                            ho_numbers = re.findall(r'\d+', ho)
-                                                            option_numbers = re.findall(r'\d+', option_text)
-                                                            
-                                                            if (option_text == ho or 
-                                                                ho in option_text or 
-                                                                option_text in ho or 
-                                                                ho_digits == option_digits or
-                                                                (ho_numbers and option_numbers and any(num in option_numbers for num in ho_numbers))):
-                                                                # JavaScript로 클릭 (더 안정적)
-                                                                driver.execute_script("arguments[0].click();", option)
-                                                                matched = True
-                                                                time.sleep(1)
-                                                                break
-                                                        except:
-                                                            continue
-                                                    
-                                                    if not matched:
-                                                        # 매칭 실패 시 첫 번째 항목 선택
-                                                        try:
-                                                            first_ho_option = driver.find_element(By.CSS_SELECTOR, 'ul#hoSelectList li:first-child button')
-                                                            driver.execute_script("arguments[0].click();", first_ho_option)
-                                                            time.sleep(1)
-                                                        except:
-                                                            pass
-                                                else:
-                                                    # 첫 번째 항목 선택
-                                                    try:
-                                                        first_ho_option = driver.find_element(By.CSS_SELECTOR, 'ul#hoSelectList li:first-child button')
-                                                        driver.execute_script("arguments[0].click();", first_ho_option)
-                                                        time.sleep(1)
-                                                    except:
-                                                        pass
-                                        except Exception as e:
-                                            pass  # 호 선택 실패 시 계속 진행
-                                        
-                                        # 서비스 조회 버튼 클릭 (button#GA_CY_MENU_C00000001)
-                                        try:
-                                            service_query_btn = driver.find_element(By.CSS_SELECTOR, 'button#GA_CY_MENU_C00000001')
-                                            if service_query_btn:
-                                                service_query_btn.click()
-                                                time.sleep(2)  # 서비스 조회 결과 대기
-                                        except:
-                                            pass
-                                except:
-                                    pass  # 팝업이 있다면 클릭, 없으면 무시
-                                
-                                # 서비스조회 결과 추출
-                                try:
-                                    service_info = []
-                                    
-                                    # 서비스 정보 셀렉터
-                                    service_selectors = [
-                                        ".service-result",
-                                        ".service-info",
-                                        ".result-table",
-                                        "table",
-                                        "div[class*='service']",
-                                        "div[class*='result']",
-                                        ".service-list",
-                                        ".avail-service"
-                                    ]
-                                    
-                                    for service_selector in service_selectors:
-                                        try:
-                                            service_elements = driver.find_elements(By.CSS_SELECTOR, service_selector)
-                                            for service_elem in service_elements:
-                                                text = service_elem.text.strip()
-                                                if text and len(text) > 10:
-                                                        service_info.append(text)
-                                        except:
-                                            continue
-                                    
-                                    if service_info:
-                                        service_result = "\n".join(service_info)
-                                    else:
-                                        # 전체 페이지 텍스트 가져오기
-                                        body_text = driver.find_element(By.TAG_NAME, "body").text
-                                    
-                                    # 인터넷과 BTV 관련 정보만 추출
-                                    if body_text:
-                                        internet_info = []
-                                        btv_info = []
-                                        lines = body_text.split('\n')
-                                        
-                                        for i, line in enumerate(lines):
-                                            line = line.strip()
-                                            # 인터넷 관련 정보 추출
-                                            if '인터넷' in line or 'Internet' in line or '인터' in line:
-                                                # 다음 몇 줄도 포함 (요금제 정보 등)
-                                                context = [line]
-                                                for j in range(1, 3):
-                                                    if i + j < len(lines):
-                                                        context.append(lines[i + j].strip())
-                                                internet_info.append(' '.join(context[:100]))  # 최대 100자
-                                            
-                                            # BTV 관련 정보 추출
-                                            if 'B tv' in line or 'BTV' in line or '비티비' in line or 'IPTV' in line:
-                                                context = [line]
-                                                for j in range(1, 3):
-                                                    if i + j < len(lines):
-                                                        context.append(lines[i + j].strip())
-                                                btv_info.append(' '.join(context[:100]))
-                                        
-                                        # 결과 구성
-                                        result_lines = []
-                                        if internet_info:
-                                            result_lines.append("📶 인터넷 서비스:")
-                                            result_lines.extend(internet_info[:3])  # 최대 3개 항목
-                                        if btv_info:
-                                            result_lines.append("\n📺 B tv 서비스:")
-                                            result_lines.extend(btv_info[:3])  # 최대 3개 항목
-                                        
-                                        if result_lines:
-                                            service_result = '\n'.join(result_lines)
-                                        else:
-                                            service_result = "인터넷 및 BTV 서비스 정보를 찾을 수 없습니다."
-                                    else:
-                                        service_result = body_text[:1000] if body_text else "결과 없음"
-                                except Exception as e:
-                                    service_result = None  # 오류 발생 시 표시하지 않음
-                            else:
-                                service_result = None  # 버튼을 찾지 못한 경우 표시하지 않음
-                        except Exception as e:
-                            service_result = None  # 오류 발생 시 표시하지 않음
-                    
-                    # 결과를 찾지 못한 경우 페이지의 모든 텍스트 확인
-                    if not results:
-                        try:
-                            # 페이지 스크린샷 저장
-                            screenshot_path = "search_result.png"
-                            driver.save_screenshot(screenshot_path)
-                            
-                            # 페이지 소스에서 검색 결과 유사 패턴 찾기
-                            page_text = driver.find_element(By.TAG_NAME, "body").text
-                            results.append(f"검색이 완료되었습니다. 총 {len(page_text)}개의 문자가 검색되었습니다.")
-                        except Exception as e:
-                            results.append(f"검색 완료 (상세 정보 추출 실패: {str(e)})")
-                    
-                except Exception as e:
-                    results.append(f"검색 완료 (결과 파싱 오류: {str(e)})")
-                
-                # 스크린샷 저장 (선택된 결과 페이지)
+                            el.click()
+                        except Exception:
+                            with contextlib.suppress(Exception):
+                                driver.execute_script("arguments[0].click();", el)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 서비스조회 버튼 클릭
+        try:
+            svc_clicked = False
+            for tag in ["button", "a"]:
+                if svc_clicked:
+                    break
                 try:
-                    screenshot_path = "search_result.png"
-                    driver.save_screenshot(screenshot_path)
-                except:
-                    screenshot_path = None
-                
-                return {
-                    "status": "success",
-                    "message": f"주소 검색이 완료되었습니다. {len(results)}개의 결과를 찾았습니다." + 
-                               (f"\n첫 번째 항목이 자동으로 선택되었습니다." if selected_result else "") +
-                               (f"\n서비스조회가 완료되었습니다." if service_result else ""),
-                    "results": results,
-                    "selected_result": selected_result,
-                    "service_result": service_result,
-                    "screenshot": screenshot_path
-                }
-            else:
-                return {
-                    "status": "error",
-                    "message": "주소 입력창을 찾을 수 없습니다."
-                }
-                
-        except Exception as e:
-            # 현재 페이지의 HTML 구조 확인용
-            page_source = driver.page_source[:1000]
-            return {
-                "status": "error",
-                "message": f"주소 검색 중 오류 발생: {str(e)}",
-                "page_preview": page_source
-            }
-        finally:
+                    for el in driver.find_elements(By.TAG_NAME, tag):
+                        with contextlib.suppress(Exception):
+                            txt = el.text.strip()
+                            if txt and ("서비스조회" in txt):
+                                try:
+                                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                                except Exception:
+                                    pass
+                                try:
+                                    el.click()
+                                except Exception:
+                                    with contextlib.suppress(Exception):
+                                        driver.execute_script("arguments[0].click();", el)
+                                svc_clicked = True
+                                break
+                except Exception:
+                    pass
+            if not svc_clicked:
+                with contextlib.suppress(Exception):
+                    el = driver.find_element(By.CSS_SELECTOR, "div.butn_wrap.event_pop_butn")
+                    el.click()
             time.sleep(1)
+        except Exception:
+            pass
+
+        # 팝업 확인 닫기 (존재 시)
+        try:
+            with contextlib.suppress(Exception):
+                c = driver.find_element(By.CSS_SELECTOR, 'a.modal_close.modal_confirm_btn')
+                if c.is_displayed():
+                    c.click()
+                    time.sleep(0.5)
+        except Exception:
+            pass
+
+        matched_dong_text = None
+        matched_ho_text = None
+
+        # 동 선택
+        if dong:
+            try:
+                with contextlib.suppress(Exception):
+                    btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button#input_Id3')))
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                    btn.click()
+                    time.sleep(0.5)
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'ul#dongSelectList')))
+                time.sleep(0.3)
+                options = driver.find_elements(By.CSS_SELECTOR, 'ul#dongSelectList li button')
+                chosen = None
+                # 선택 가능한 항목들의 "중간값" 선택
+                if options:
+                    try:
+                        selectable = [o for o in options if o.is_displayed() and o.is_enabled()] or options
+                        mid_idx = len(selectable) // 2
+                        chosen = selectable[mid_idx]
+                    except Exception:
+                        chosen = options[len(options)//2]
+                if chosen:
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", chosen)
+                    except Exception:
+                        pass
+                    try:
+                        chosen.click()
+                    except Exception:
+                        with contextlib.suppress(Exception):
+                            driver.execute_script("arguments[0].click();", chosen)
+                    time.sleep(0.5)
+            except Exception:
+                pass
+
+        # 호 선택
+        if ho:
+            try:
+                with contextlib.suppress(Exception):
+                    btn = driver.find_element(By.CSS_SELECTOR, 'button#input_Id4')
+                    if btn.is_displayed():
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                        btn.click()
+                        time.sleep(0.4)
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'ul#hoSelectList')))
+                time.sleep(0.3)
+                options = driver.find_elements(By.CSS_SELECTOR, 'ul#hoSelectList li button')
+                chosen = None
+                # 선택 가능한 항목들의 "중간값" 선택
+                if options:
+                    try:
+                        selectable = [o for o in options if o.is_displayed() and o.is_enabled()] or options
+                        mid_idx = len(selectable) // 2
+                        chosen = selectable[mid_idx]
+                    except Exception:
+                        chosen = options[len(options)//2]
+                if chosen:
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", chosen)
+                    except Exception:
+                        pass
+                    try:
+                        chosen.click()
+                    except Exception:
+                        with contextlib.suppress(Exception):
+                            driver.execute_script("arguments[0].click();", chosen)
+                    time.sleep(0.5)
+            except Exception:
+                pass
+
+        # 최종 서비스 조회 버튼(있다면) 한 번 더 시도
+        try:
+            with contextlib.suppress(Exception):
+                btn = driver.find_element(By.CSS_SELECTOR, 'button#GA_CY_MENU_C00000001')
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                    btn.click()
+                    time.sleep(1.0)
+        except Exception:
+            pass
+
+        screenshot_path = "search_result.png"
+        try:
+            driver.save_screenshot(screenshot_path)
+        except Exception:
+            screenshot_path = None
+
+        # 브라우저 유지 옵션 (요청 시 창 띄워 보기)
+        keep_browser = os.getenv("SELENIUM_KEEP_BROWSER", "0") == "1"
+        if not keep_browser:
             driver.quit()
-            
-    except Exception as e:
         return {
-            "status": "error",
-            "message": f"브라우저 실행 중 오류 발생: {str(e)}"
+            "status": "success",
+            "message": f"주소 검색이 완료되었습니다. {len(results)}개의 결과를 찾았습니다." + ("\n첫 번째 항목이 자동으로 선택되었습니다." if selected_result else ""),
+            "results": results,
+            "selected_result": selected_result,
+            "service_result": None,
+            "screenshot": screenshot_path
         }
+    except Exception as e:
+        try:
+            screenshot_path = "error_page.png"
+            try:
+                driver.save_screenshot(screenshot_path)
+            except Exception:
+                screenshot_path = None
+            driver.quit()
+        except Exception:
+            pass
+        return {"status": "error", "message": f"브라우저 실행 중 오류 발생: {str(e)}"}
 
-
+# 기존 호출을 Selenium 구현으로 교체
+search_address = search_address_selenium
 def process_excel_data(excel_file):
     """엑ល 파일을 읽어서 데이터프레임 반환"""
     try:
@@ -671,9 +746,62 @@ def main():
         layout="wide"
     )
     
-    # 사이드바 - 엑셀 파일 업로드 및 이메일 설정
+    # 서비스 계정 키 로드
+    SERVICE_ACCOUNT_CREDENTIALS = load_service_account()
+    
+    # 사이드바 - Google Sheets 데이터 로드 및 이메일 설정
     with st.sidebar:
-        st.header("📂 파일 관리")
+        st.header("📂 데이터 관리")
+        
+        # Google Sheets에서 자동으로 데이터 로드
+        if SERVICE_ACCOUNT_CREDENTIALS:
+            st.info("📊 Google Sheets에서 자동으로 데이터를 불러옵니다.")
+            
+            # 데이터가 없으면 자동으로 로드
+            if 'excel_data' not in st.session_state:
+                with st.spinner("Google Sheets에서 데이터를 가져오는 중..."):
+                    df, error = load_google_sheets_data(SERVICE_ACCOUNT_CREDENTIALS)
+                    if df is not None and error is None:
+                        st.session_state.excel_data = df
+                        st.session_state.uploaded_file_name = "Google Sheets (시트1)"
+                        st.success("✅ Google Sheets에서 데이터를 성공적으로 불러왔습니다!")
+                        st.info(f"📊 총 {len(df)}개의 행을 불러왔습니다.")
+                    else:
+                        st.error(f"❌ {error if error else '데이터를 불러올 수 없습니다.'}")
+                        st.session_state.excel_data = None
+            
+            # 데이터가 있는 경우 표시 및 새로고침 버튼
+            if 'excel_data' in st.session_state and st.session_state.excel_data is not None:
+                st.success(f"✅ Google Sheets (시트1) 사용 중")
+                st.info(f"📊 {len(st.session_state.excel_data)}개의 행")
+                if st.button("🔄 Google Sheets 새로고침"):
+                    with st.spinner("Google Sheets에서 데이터를 가져오는 중..."):
+                        df, error = load_google_sheets_data(SERVICE_ACCOUNT_CREDENTIALS)
+                        if df is not None and error is None:
+                            st.session_state.excel_data = df
+                            st.session_state.uploaded_file_name = "Google Sheets (시트1)"
+                            st.success("✅ 데이터를 새로고침했습니다!")
+                            st.info(f"📊 총 {len(df)}개의 행을 불러왔습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {error if error else '데이터를 불러올 수 없습니다.'}")
+            
+            # 접근 권한 안내
+            with st.expander("ℹ️ Google Sheets 접근 권한 안내", expanded=False):
+                st.success("✅ 서비스 계정 권한이 설정되었습니다!")
+                st.markdown(f"""
+                **서비스 계정 이메일:**
+                ```
+                {SERVICE_ACCOUNT_CREDENTIALS.get('client_email', 'ai-coding@huhsame-project-1.iam.gserviceaccount.com')}
+                ```
+                
+                **Google Sheets 링크:**
+                [시트 열기](https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}/edit)
+                """)
+        else:
+            st.warning("⚠️ Google Sheets를 사용하려면 서비스 계정 키가 필요합니다.")
+            st.markdown("---")
+            st.header("📂 엑셀 파일 업로드 (대체 옵션)")
         uploaded_file = st.file_uploader(
             "요금 설계용 엑셀 파일 업로드",
             type=['xlsx', 'xls'],
@@ -696,12 +824,28 @@ def main():
             else:
                 st.success(f"✅ {uploaded_file.name} 사용 중")
                 
-        # 파일 초기화 버튼
-        if st.button("🗑️ 파일 초기화"):
+        # 데이터 초기화 버튼
+        if st.button("🗑️ 데이터 초기화"):
             for key in ['excel_data', 'uploaded_file_name', 'selections']:
                 if key in st.session_state:
                     del st.session_state[key]
             st.rerun()
+        
+        st.markdown("---")
+        
+        # Google 서비스 계정 상태 표시
+        st.header("🔐 Google 서비스 계정")
+        if SERVICE_ACCOUNT_CREDENTIALS:
+            st.success("✅ 서비스 계정 키가 로드되었습니다!")
+            with st.expander("서비스 계정 정보", expanded=False):
+                st.json({
+                    "project_id": SERVICE_ACCOUNT_CREDENTIALS.get("project_id"),
+                    "client_email": SERVICE_ACCOUNT_CREDENTIALS.get("client_email"),
+                    "client_id": SERVICE_ACCOUNT_CREDENTIALS.get("client_id")
+                })
+        else:
+            st.warning("⚠️ 서비스 계정 키 파일을 찾을 수 없습니다.")
+            st.caption("service_account_key.json 파일이 필요합니다.")
         
         st.markdown("---")
         
@@ -763,7 +907,7 @@ def main():
     st.title("📡 SK 인터넷 설계 안내 페이지")
     st.markdown("안녕하세요! SK인터넷 찾아주셔서 감사합니다. 요금안내 및 설치가능 지역 조회를 선택하시면 안내드리겠습니다. 😊")
     st.markdown("결과 조회 후 상담을 원하시면 채팅창에 전화번호를 남겨주시거나 전화주시기 바랍니다.")
-    st.markdown("사이드바에서 엑셀 파일을 업로드한 후 상품 조건을 선택하면, 선택 결과를 요약해 보여드립니다.")
+    st.markdown("사이드바에서 Google Sheets 데이터가 자동으로 로드되며, 상품 조건을 선택하면 선택 결과를 요약해 보여드립니다.")
     
     # 두 개의 컬럼으로 구성: 요금 설계와 주소 조회
     col_left, col_right = st.columns([1, 1])
@@ -849,7 +993,7 @@ def main():
             else:
                 st.info("💡 각 항목을 선택해주세요.")
         else:
-            st.info("👈 먼저 사이드바에서 엑셀 파일을 업로드해주세요.")
+            st.info("👈 먼저 사이드바에서 Google Sheets 데이터가 로드되길 기다려주세요.")
     
     with col_right:
         st.markdown("### 📍 설치 가능지역 조회")
@@ -903,6 +1047,7 @@ def main():
         
         # 검색 결과 표시
         if search_button and address_input:
+            st.info("검색 버튼을 눌러주고 잠시만 기다려주세요. 다른 화면이 뜨면 자동으로 꺼지니 기다려주세요~")
             with st.spinner("주소를 검색하는 중입니다..."):
                 result = search_address(address_input, dong_input, ho_input)
                 
