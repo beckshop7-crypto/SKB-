@@ -1,0 +1,22 @@
+# Python 기본 유틸리티
+requests>=2.31.0
+
+# Streamlit
+streamlit>=1.28.0
+
+# Browser Automation - Playwright (기본, 권장)
+# playwright>=1.40.0
+
+# Browser Automation - Selenium (기본 사용)
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+
+# Excel 처리
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Google Sheets API
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+gspread>=5.12.0
+
